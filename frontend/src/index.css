@@ -1,0 +1,18 @@
+/* Minimal global reset and font setup. App-specific styles live in App.css */
+:root {
+  --app-font: system-ui, Avenir, Helvetica, Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  font-family: var(--app-font);
+}
+
+/* Keep anchor and button defaults lightweight so App.css can override as needed */
+a { color: inherit; text-decoration: none; }
+button { font-family: inherit; }
+
+/* Do not enforce background or layout here; the app's CSS controls those styles */

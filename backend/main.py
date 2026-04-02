@@ -83,7 +83,9 @@ async def log_activity(email: str, action: str, request: Request):
     await activity_collection.insert_one(log_entry)
 
 def log_otp_to_file(email: str, otp: str):
-    with open("otp_debug.txt", "a") as f:
+    # Ensure it writes to the root otp_debug.txt for easier access
+    root_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "otp_debug.txt")
+    with open(root_path, "a") as f:
         f.write(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] OTP for {email}: {otp}\n")
 
 def hash_password(password: str):

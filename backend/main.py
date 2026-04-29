@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr
 from jose import JWTError, jwt
@@ -37,6 +39,19 @@ MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 
 app = FastAPI()
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    for error in exc.errors():
+        if "email" in error.get("loc", []):
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={"detail": "email not found/ invaild"},
+            )
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": exc.errors()},
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,7 +67,7 @@ db = client.auth_db
 users_collection = db.users
 activity_collection = db.activity_logs
 
-# ---------------- MODELS-3 ----------------
+# ---------------- MODELS ----------------
 
 class UserRegister(BaseModel):
     email: EmailStr
@@ -83,7 +98,6 @@ async def log_activity(email: str, action: str, request: Request):
     await activity_collection.insert_one(log_entry)
 
 def log_otp_to_file(email: str, otp: str):
-    # Ensure it writes to the root otp_debug.txt for easier access
     root_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "otp_debug.txt")
     with open(root_path, "a") as f:
         f.write(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] OTP for {email}: {otp}\n")
@@ -113,8 +127,6 @@ async def get_current_user(token: str):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# ---------------- received EMAIL----------------
-
 async def send_otp_email(email: str, otp: str):
     log_otp_to_file(email, otp)
     if not SMTP_USER or not SMTP_PASS:
@@ -124,17 +136,9 @@ async def send_otp_email(email: str, otp: str):
     message = EmailMessage()
     message["From"] = MAIL_FROM
     message["To"] = email
-    message["Subject"] = "Your Login OTP"
+    message["Subject"] = "Your Verification OTP"
 
-    message.set_content(f"""
-Hello,
-
-Your verification code is: {otp}
-
-This OTP will expire in 5 minutes.
-
-Secure Login System
-""")
+    message.set_content(f"Hello,\n\nYour verification code is: {otp}\n\nThis OTP will expire in 5 minutes.\n\nSecure Auth System\n")
 
     try:
         await aiosmtplib.send(
@@ -148,29 +152,59 @@ Secure Login System
         print(f"SUCCESS: Email sent to {email}")
     except Exception as e:
         print(f"FAILED to send email: {e}")
-        print(f"--- DEBUG OTP: {otp} ---") # So you can still login!
 
 # ---------------- ROUTES ----------------
 
 @app.post("/register")
 async def register(user: UserRegister):
+    # Check if the email exists in our system (authorized users)
     existing_user = await users_collection.find_one({"email": user.email})
-    if existing_user:
-        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # 1. If user NOT in database at all -> email not authorized
+    if not existing_user:
+        raise HTTPException(status_code=400, detail="email not found/ invaild")
 
-    new_user = {
-        "email": user.email,
-        "password": hash_password(user.password),
-        "totp_secret": pyotp.random_base32(),
-        "created_at": datetime.utcnow(),
-        "last_login": None,
-        "current_otp": None,
-        "otp_expiry": None,
-        "recovery_codes": [secrets.token_hex(4).upper() for _ in range(5)]
-    }
+    # 2. If user IS in database but ALREADY verified -> redirect to login (or show error)
+    if existing_user.get("is_verified", False):
+        raise HTTPException(status_code=400, detail="email not found/ invaild")
 
-    await users_collection.insert_one(new_user)
-    return {"message": "User registered successfully"}
+    # 3. User is in database but NOT yet verified -> Generate OTP for registration
+    otp = str(secrets.randbelow(1000000)).zfill(6)
+    expiry = datetime.utcnow() + timedelta(minutes=5)
+
+    # Update the existing user record with the password and new OTP
+    await users_collection.update_one(
+        {"email": user.email},
+        {"$set": {
+            "password": hash_password(user.password),
+            "current_otp": otp,
+            "otp_expiry": expiry,
+            "totp_secret": pyotp.random_base32(),
+            "created_at": datetime.utcnow(),
+            "recovery_codes": [secrets.token_hex(4).upper() for _ in range(5)]
+        }}
+    )
+
+    asyncio.create_task(send_otp_email(user.email, otp))
+    return {"message": "OTP sent to email for registration verification"}
+
+@app.post("/verify-registration")
+async def verify_registration(data: VerifyOTP):
+    user = await users_collection.find_one({"email": data.email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.get("current_otp") == data.otp:
+        if datetime.utcnow() < user.get("otp_expiry"):
+            await users_collection.update_one(
+                {"email": data.email},
+                {"$set": {"is_verified": True, "current_otp": None, "otp_expiry": None}}
+            )
+            return {"message": "Email verified successfully. You can now login."}
+        else:
+            raise HTTPException(status_code=400, detail="OTP expired")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid OTP")
 
 @app.post("/login")
 async def login(user: UserLogin, request: Request):
@@ -178,6 +212,9 @@ async def login(user: UserLogin, request: Request):
     if not db_user or not verify_password(user.password, db_user["password"]):
         await log_activity(user.email, "Failed Login Attempt", request)
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    if not db_user.get("is_verified", True):
+        raise HTTPException(status_code=401, detail="Email not verified. Please register again.")
 
     otp = str(secrets.randbelow(1000000)).zfill(6)
     expiry = datetime.utcnow() + timedelta(minutes=5)
@@ -193,16 +230,13 @@ async def login(user: UserLogin, request: Request):
 
 @app.get("/setup-2fa")
 async def setup_2fa(email: str):
-    print(f"DEBUG: Setting up 2FA for {email}")
     try:
         user = await users_collection.find_one({"email": email})
         if not user:
-            print(f"DEBUG: User {email} not found in DB")
             raise HTTPException(status_code=404, detail="User not found")
         
         secret = user.get("totp_secret")
         if not secret:
-            print(f"DEBUG: Generating new totp_secret for {email}")
             secret = pyotp.random_base32()
             await users_collection.update_one({"email": email}, {"$set": {"totp_secret": secret}})
         
@@ -214,51 +248,33 @@ async def setup_2fa(email: str):
         img.save(buffered, format="PNG")
         img_str = base64.b64encode(buffered.getvalue()).decode()
         
-        print(f"DEBUG: QR Code generated successfully for {email}")
         return {"qr_code": f"data:image/png;base64,{img_str}", "secret": secret}
     except Exception as e:
-        print(f"ERROR in setup_2fa: {e}")
-        import traceback
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/verify-2fa")
 async def verify_2fa(data: VerifyOTP, request: Request):
-    print(f"DEBUG: Verifying 2FA for {data.email} with code {data.otp}")
     try:
         user = await users_collection.find_one({"email": data.email})
         if not user:
-            print("DEBUG: User not found")
             raise HTTPException(status_code=404, detail="User not found")
 
         is_valid = False
-        
-        # 1. Check TOTP (App)
         secret = user.get("totp_secret")
         if secret:
             totp = pyotp.TOTP(secret)
             if totp.verify(data.otp):
-                print("DEBUG: TOTP (App) verification success")
                 is_valid = True
         
-        # 2. Check Email OTP
         if not is_valid:
             curr_otp = user.get("current_otp")
             expiry = user.get("otp_expiry")
-            print(f"DEBUG: Checking Email OTP. Saved: {curr_otp}, Expiry: {expiry}")
-            
-            if curr_otp == data.otp:
-                if datetime.utcnow() < expiry:
-                    print("DEBUG: Email OTP verification success")
-                    is_valid = True
-                    await users_collection.update_one({"email": data.email}, {"$set": {"current_otp": None}})
-                else:
-                    print("DEBUG: Email OTP expired")
+            if curr_otp == data.otp and datetime.utcnow() < expiry:
+                is_valid = True
+                await users_collection.update_one({"email": data.email}, {"$set": {"current_otp": None}})
         
-        # 3. Check Recovery Codes
         if not is_valid:
             if data.otp.upper() in user.get("recovery_codes", []):
-                print("DEBUG: Recovery code verification success")
                 is_valid = True
                 await users_collection.update_one(
                     {"email": data.email}, 
@@ -266,29 +282,24 @@ async def verify_2fa(data: VerifyOTP, request: Request):
                 )
 
         if is_valid:
-            print(f"DEBUG: Generating token for {data.email}")
             token = create_access_token({"sub": user["email"]})
             await users_collection.update_one({"email": data.email}, {"$set": {"last_login": datetime.utcnow()}})
             await log_activity(data.email, "Login Successful (2FA)", request)
             return {"access_token": token, "token_type": "bearer"}
         else:
-            print("DEBUG: All verification methods failed")
             await log_activity(data.email, "Failed 2FA Attempt", request)
             raise HTTPException(status_code=400, detail="Invalid or expired code")
             
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"ERROR in verify_2fa: {e}")
-        import traceback
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/user/me")
 async def read_users_me(user = Depends(get_current_user)):
-    # Fetch recent activity logs from MongoDB
     logs_cursor = activity_collection.find({"email": user["email"]}).sort("timestamp", -1).limit(10)
     logs = await logs_cursor.to_list(length=10)
     
-    # Format logs for frontend
     formatted_logs = []
     for log in logs:
         formatted_logs.append({
